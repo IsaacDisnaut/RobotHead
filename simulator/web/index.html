@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nong Mali Simulator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="splash">
+    <div class="splash-card">
+      <div class="splash-title">น้องมะลิ · Robot Simulator</div>
+      <p>จำลองหุ่นยนต์ต้อนรับ (ESP32-S3 + จอตา GC9A01 ×2 + ปาก Jawduino + robot_brain.py)</p>
+      <button id="startBtn" class="btn primary big">คลิกเพื่อเริ่มจำลอง</button>
+      <p class="muted small">ต้องคลิกก่อน เพื่อให้เบราว์เซอร์อนุญาตเปิดเสียงพูดของหุ่น</p>
+    </div>
+  </div>
+
+  <main class="app">
+    <section id="viewport">
+      <div id="three"></div>
+
+      <div class="hud top-left">
+        <div id="statusBar" class="status-bar idle">State: IDLE</div>
+        <div class="chips">
+          <span class="chip" id="chipState">IDLE</span>
+          <span class="chip" id="chipFace">ไม่มีลูกค้า</span>
+          <span class="chip" id="chipHw">หุ่นจริง: ไม่ได้เชื่อมต่อ</span>
+        </div>
+        <div class="meters">
+          <div class="meter"><span>Pan</span><b id="mPan">90°</b><i><em id="bPan"></em></i></div>
+          <div class="meter"><span>Tilt</span><b id="mTilt">90°</b><i><em id="bTilt"></em></i></div>
+          <div class="meter"><span>Jaw</span><b id="mJaw">15°</b><i><em id="bJaw"></em></i></div>
+          <div class="meter"><span>KA2284</span><b id="mLed" class="leds"><s></s><s></s><s></s></b></div>
+        </div>
+      </div>
+
+      <div class="hud top-right eyes-preview">
+        <div class="eyes-row">
+          <canvas id="eyeR" width="120" height="120" title="จอตาขวาของหุ่น (CS GPIO10)"></canvas>
+          <canvas id="eyeL" width="120" height="120" title="จอตาซ้ายของหุ่น (CS GPIO14)"></canvas>
+        </div>
+        <div class="muted small center">จอ GC9A01 ทั้ง 2 ข้าง</div>
+      </div>
+
+      <div class="hud bottom-left serial">
+        <div class="serial-head">
+          <span>Serial Monitor → ESP32-S3 (115200)</span>
+          <button id="clearSerial" class="btn tiny ghost">ล้าง</button>
+        </div>
+        <div id="serialLog"></div>
+      </div>
+
+      <div class="hud bottom-right view-btns">
+        <button class="btn tiny" id="viewFront">มุมหน้า</button>
+        <button class="btn tiny" id="viewReset">มุมเฉียง</button>
+        <button class="btn tiny" id="viewWide" title="เห็นทั้งหุ่นและตำแหน่งคนที่กล้องเห็น">มุมกว้าง</button>
+        <label class="btn tiny"><input type="checkbox" id="showMask" checked> หน้ากาก</label>
+      </div>
+      <div id="toast"></div>
+    </section>
+
+    <aside id="panel">
+      <nav class="tabs">
+        <button class="tab active" data-tab="chat">💬 คุยกับ AI</button>
+        <button class="tab" data-tab="control">🎮 ควบคุม</button>
+        <button class="tab" data-tab="camera">📷 กล้อง/ลูกค้า</button>
+        <button class="tab" data-tab="settings">⚙️ ตั้งค่า</button>
+      </nav>
+
+      <!-- ===== CHAT ===== -->
+      <section class="pane active" id="pane-chat">
+        <div class="ai-line"><span id="aiDot" class="dot"></span><span id="aiStatus">กำลังตรวจสอบ AI...</span></div>
+        <div id="chatLog"></div>
+        <div class="quick">
+          <button class="qp">สวัสดีค่ะ</button>
+          <button class="qp">หันไปทางซ้ายหน่อย</button>
+          <button class="qp">ผงกหัวให้ดูหน่อย</button>
+          <button class="qp">มองขึ้นข้างบนแล้วทำท่าคิด</button>
+          <button class="qp">แนะนำของกินเมืองคอนหน่อย</button>
+          <button class="qp">ส่ายหน้าซ้ายขวาให้ดูหน่อย</button>
+          <button class="qp">ขอบคุณนะ บ๊ายบาย</button>
+        </div>
+        <form id="chatForm" class="chat-input">
+          <button type="button" id="micBtn" class="btn mic" title="กดแล้วพูด (หยุดเองเมื่อเงียบ 0.6 วิ)">🎙️</button>
+          <input id="chatText" autocomplete="off" placeholder="พิมพ์คุยหรือสั่งหุ่น เช่น 'หันขวาแล้วยิ้มหน่อย'">
+          <button class="btn primary" type="submit">ส่ง</button>
+        </form>
+        <div class="row between">
+          <label class="switch"><input type="checkbox" id="contListen"><span></span> ฟังต่อเนื่อง (เหมือนหุ่นจริง)</label>
+          <div class="mic-meter"><em id="micLevel"></em></div>
+          <button class="btn tiny ghost" id="stopSpeak">หยุดพูด</button>
+        </div>
+        <div id="micNote" class="muted small"></div>
+      </section>
+
+      <!-- ===== CONTROL ===== -->
+      <section class="pane" id="pane-control">
+        <h3>ท่าทางสำเร็จรูป (คำสั่ง Serial)</h3>
+        <div class="grid4">
+          <button class="btn cmd" data-cmd="NOD">NOD<small>ผงกหัว</small></button>
+          <button class="btn cmd" data-cmd="TILT">TILT<small>เอียงคอฟัง</small></button>
+          <button class="btn cmd" data-cmd="THINK">THINK<small>เหลือบตาคิด</small></button>
+          <button class="btn cmd" data-cmd="I">I<small>กลับท่าพัก</small></button>
+        </div>
+
+        <h3>ควบคุมด้วยมือ <small class="muted">ส่ง <code>T,pan,tilt,eyeX,eyeY</code> ทุก 50ms</small></h3>
+        <label class="switch"><input type="checkbox" id="manualMode"><span></span> เปิดควบคุมด้วยมือ (หยุดติดตามใบหน้าชั่วคราว)</label>
+        <div class="slider"><label>Pan (คอซ้าย-ขวา)</label><input type="range" id="sPan" min="30" max="150" value="90"><output id="oPan">90</output></div>
+        <div class="slider"><label>Tilt (ก้ม-เงย)</label><input type="range" id="sTilt" min="50" max="130" value="90"><output id="oTilt">90</output></div>
+        <div class="slider"><label>Eye X</label><input type="range" id="sEyeX" min="0" max="1023" value="512"><output id="oEyeX">512</output></div>
+        <div class="slider"><label>Eye Y</label><input type="range" id="sEyeY" min="0" max="1023" value="512"><output id="oEyeY">512</output></div>
+        <div id="eyePad" class="eyepad" title="ลากเพื่อกลอกตา + หันคอ"><span></span></div>
+        <button class="btn tiny ghost" id="centerBtn">กลับตรงกลาง</button>
+
+        <h3>ส่งคำสั่ง Serial เอง</h3>
+        <form id="rawForm" class="row">
+          <input id="rawCmd" placeholder="เช่น T,120,100,800,300 หรือ NOD">
+          <button class="btn" type="submit">ส่ง</button>
+        </form>
+
+        <h3>ทดสอบปาก (Jawduino) / เสียงพูด</h3>
+        <form id="sayForm" class="row">
+          <input id="sayText" value="สวัสดีค่ะ หนูชื่อน้องมะลิ ยินดีต้อนรับสู่เมืองคอนนะคะ">
+          <button class="btn" type="submit">พูด</button>
+        </form>
+        <div class="slider"><label>ระดับเสียง (LED 0-3)</label><input type="range" id="sJaw" min="0" max="3" step="1" value="0"><output id="oJaw">0</output></div>
+      </section>
+
+      <!-- ===== CAMERA ===== -->
+      <section class="pane" id="pane-camera">
+        <div class="row" id="realCamRow">
+          <select id="camIndex">
+            <option value="0">กล้องหมายเลข 0</option>
+            <option value="1">กล้องหมายเลข 1</option>
+            <option value="2">กล้องหมายเลข 2</option>
+          </select>
+          <button class="btn tiny" id="camRetry">↻ เปิดกล้องใหม่</button>
+          <span id="camInfo" class="muted small">-</span>
+        </div>
+        <p class="muted small">ใช้กล้องคอมจริง ตรวจจับใบหน้าด้วย <code>haarcascade_frontalface_default.xml</code> ค่าเดียวกับ robot_brain.py — เดินเข้าใกล้กล้องให้กรอบเป็นสีเหลือง น้องมะลิจะทักทาย</p>
+        <canvas id="camCanvas" width="640" height="480"></canvas>
+        <img id="camImg" alt="" hidden>
+        <table class="readout">
+          <tr><td>face_ratio</td><td id="rRatio">-</td></tr>
+          <tr><td>norm_x / norm_y</td><td id="rNorm">-</td></tr>
+          <tr><td>ระยะโดยประมาณ</td><td id="rDist">-</td></tr>
+          <tr><td>pan_deg / tilt_deg</td><td id="rPT">-</td></tr>
+          <tr><td>eye_x / eye_y</td><td id="rEye">-</td></tr>
+          <tr><td>ทักทายเมื่อ ratio ≥</td><td id="rThr">0.24</td></tr>
+        </table>
+        <label class="switch"><input type="checkbox" id="autoBrain" checked><span></span> เปิดสมองอัตโนมัติ (robot_brain.py)</label>
+      </section>
+
+      <!-- ===== SETTINGS ===== -->
+      <section class="pane" id="pane-settings">
+        <h3>ค่าตั้งจาก robot_brain.py</h3>
+        <div class="grid2">
+          <label class="switch"><input type="checkbox" id="cfgRevPan"><span></span> REVERSE_PAN</label>
+          <label class="switch"><input type="checkbox" id="cfgRevTilt"><span></span> REVERSE_TILT</label>
+          <label class="switch"><input type="checkbox" id="cfgRevEyeX"><span></span> REVERSE_EYE_X</label>
+          <label class="switch"><input type="checkbox" id="cfgRevEyeY"><span></span> REVERSE_EYE_Y</label>
+        </div>
+        <div class="slider"><label>FACE_CLOSE_THRESHOLD</label><input type="range" id="cfgThr" min="0.1" max="0.4" step="0.01"><output id="oThr"></output></div>
+        <div class="slider"><label>MIC_ENERGY_THRESHOLD</label><input type="range" id="cfgMic" min="100" max="900" step="10"><output id="oMic"></output></div>
+        <div class="slider"><label>ความเร็วเสียงพูด</label><input type="range" id="cfgRate" min="0.8" max="1.5" step="0.05" value="1.15"><output id="oRate">1.15</output></div>
+        <p class="muted small">ลำโพงที่ใช้พูด (ถ้าชื่อลำโพงไม่ขึ้น กดไมค์หนึ่งครั้งเพื่ออนุญาตเสียง แล้วกด ↻)</p>
+        <div class="row">
+          <select id="spkSel"></select>
+          <button class="btn" id="spkRefresh">↻</button>
+          <button class="btn" id="spkTest">ทดสอบ</button>
+        </div>
+
+        <h3>ข้อมูลอ้างอิง (โฟลเดอร์ information)</h3>
+        <p class="muted small">ใส่ไฟล์ .txt .md .csv .json .docx .pdf ลงในโฟลเดอร์ <code>information</code> น้องมะลิจะอ่านเวลาตอบคำถาม (เพิ่ม/แก้ไฟล์แล้วใช้ได้ทันที ไม่ต้องปิดโปรแกรม) — ไฟล์ที่ขึ้นต้นด้วย <code>_</code> จะถูกข้าม</p>
+        <div id="infoList" class="info-list"></div>
+        <div class="row">
+          <button class="btn" id="infoOpen">📂 เปิดโฟลเดอร์</button>
+          <button class="btn" id="infoReload">↻ โหลดใหม่</button>
+        </div>
+
+        <h3>ต่อหุ่นจริง (ทางเลือก)</h3>
+        <p class="muted small">ส่งคำสั่งเดียวกับในจำลองไปยัง ESP32-S3 จริงด้วย (ปิด robot_brain.py ก่อน เพราะใช้ COM พอร์ตเดียวกัน)</p>
+        <div class="row">
+          <select id="portSel"></select>
+          <button class="btn" id="portRefresh">↻</button>
+          <button class="btn primary" id="portConnect">เชื่อมต่อ</button>
+        </div>
+        <p class="muted small">ปากหุ่น (Arduino Nano ที่ลงเฟิร์มแวร์ <code>firmware/jawduino</code>) — ปากจริงจะขยับตามเสียงพูดในจำลอง</p>
+        <div class="row">
+          <select id="jawPortSel"></select>
+          <button class="btn primary" id="jawConnect">เชื่อมต่อปาก</button>
+        </div>
+
+        <h3>AI</h3>
+        <table class="readout">
+          <tr><td>สถานะ</td><td id="sAi">-</td></tr>
+          <tr><td>โมเดลแชท</td><td id="sChatModel">-</td></tr>
+          <tr><td>แปลงเสียง (STT)</td><td id="sSttModel">-</td></tr>
+          <tr><td>API key</td><td>อ่านจาก <code>api.txt</code></td></tr>
+        </table>
+      </section>
+    </aside>
+  </main>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

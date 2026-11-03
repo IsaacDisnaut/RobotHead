@@ -1,0 +1,498 @@
+import os
+import sys
+import time
+import random
+import threading
+import serial
+import cv2
+import pygame
+import speech_recognition as sr
+import pyttsx3
+from gtts import gTTS
+
+# ==================== CONFIGURATION ====================
+SERIAL_PORT = "COM11"      # พอร์ตของ ESP32-S3
+BAUD_RATE = 115200
+JAW_SERIAL_PORT = None     # พอร์ตของ Arduino Nano (ปากหุ่น) เช่น "COM5" / None = ไม่ได้ต่อ
+
+# ทิศทางเซอร์โว
+REVERSE_PAN   = True
+REVERSE_TILT  = True
+REVERSE_EYE_X = False
+REVERSE_EYE_Y = False
+
+# เกณฑ์ระยะห่างใบหน้า
+FACE_CLOSE_THRESHOLD = 0.24   # ระยะยืนใกล้ที่เริ่มทักทาย
+
+# ⭐ ค่าความไวไมโครโฟน (300 - 450 = ได้ยินชัดเจนจากระยะ 1.5 - 2 เมตร)
+# หากห้องมีเสียงแอร์/พัดลมดังรบกวนมากเกินไป สามารถเพิ่มเป็น 500 - 700 ได้ครับ
+MIC_ENERGY_THRESHOLD = 350
+
+# Gemini API Key: ใส่ในไฟล์ gemini_key.txt (บรรทัดเดียว) หรือตัวแปรสภาพแวดล้อม GEMINI_API_KEY
+# (ไม่เขียนไว้ในโค้ด เพื่อไม่ให้ key หลุดขึ้น git / ถ้าไม่มี key จะใช้คำตอบสำรองสุภาพ)
+def load_gemini_key():
+    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_key.txt")
+    try:
+        with open(key_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line.split("=", 1)[-1].strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return os.environ.get("GEMINI_API_KEY", "")
+
+GEMINI_API_KEY = load_gemini_key()
+
+# ==================== AUDIO & TTS SETUP ====================
+pygame.mixer.init()
+tts_engine = pyttsx3.init()
+tts_engine.setProperty('rate', 155)
+
+# ==================== JAW (ปากหุ่น: Arduino Nano) ====================
+JAW_FRAME = 0.03   # ส่งระดับปากทุก 30ms
+
+jaw_ser = None
+if JAW_SERIAL_PORT:
+    try:
+        jaw_ser = serial.Serial(JAW_SERIAL_PORT, BAUD_RATE, timeout=0.02)
+        time.sleep(2.0)   # Nano รีเซ็ตตัวเองตอนเปิดพอร์ต รอบูตให้เสร็จ
+        print(f"[✓] ปากหุ่น (Nano) เชื่อมต่อที่ {JAW_SERIAL_PORT}")
+    except Exception as e:
+        print(f"[!] ปากหุ่น (Nano) เชื่อมต่อไม่ได้: {e}")
+
+def send_jaw(pct):
+    """สั่งอ้าปาก 0 (หุบ) - 100 (อ้าสุด)"""
+    if jaw_ser:
+        try:
+            jaw_ser.write(f"J{int(pct)}\n".encode())
+        except Exception:
+            pass
+
+def jaw_envelope(sound):
+    """แปลงเสียงเป็นระดับอ้าปาก 0-100 ทุกๆ JAW_FRAME วินาที"""
+    import numpy as np
+    freq = pygame.mixer.get_init()[0]
+    samples = pygame.sndarray.array(sound).astype(np.float32)
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+    win = max(1, int(freq * JAW_FRAME))
+    n = len(samples) // win
+    if n == 0:
+        return []
+    rms = np.sqrt((samples[: n * win].reshape(n, win) ** 2).mean(axis=1))
+    peak = np.percentile(rms, 95) or 1.0
+    level = np.clip((rms / peak - 0.12) / 0.88, 0, 1)   # ตัดเสียงเบาๆ ออก ปากจะหุบสนิทตอนเว้นวรรค
+    return [int(v * 100) for v in level]
+
+def play_with_jaw(path):
+    try:
+        sound = pygame.mixer.Sound(path)
+    except pygame.error:
+        # pygame รุ่นเก่าเปิด mp3 ด้วย Sound ไม่ได้ -> เล่นแบบเดิม ปากขยับแบบสุ่ม
+        pygame.mixer.music.load(path)
+        pygame.mixer.music.play()
+        fake_jaw_while(pygame.mixer.music.get_busy)
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.04)
+        pygame.mixer.music.unload()
+        return
+    env = jaw_envelope(sound) if jaw_ser else []
+    channel = sound.play()
+    t0 = time.time()
+    while channel.get_busy():
+        i = int((time.time() - t0) / JAW_FRAME)
+        if i < len(env):
+            send_jaw(env[i])
+        time.sleep(JAW_FRAME)
+    send_jaw(0)
+
+def fake_jaw_while(busy):
+    """ขยับปากแบบสุ่มระหว่างพูด (ใช้กับ pyttsx3 ที่อ่านระดับเสียงไม่ได้)"""
+    def run():
+        while busy():
+            send_jaw(random.choice([0, 30, 60, 90, 50]))
+            time.sleep(0.12)
+        send_jaw(0)
+    threading.Thread(target=run, daemon=True).start()
+
+def speak_female_voice(text):
+    """พูดภาษาไทยด้วยเสียงผู้หญิง อ่อนหวาน ไพเราะ ไม่ค้างกล้อง (ปากขยับตามเสียง)"""
+    print(f"\n[น้องมะลิ]: {text}")
+    temp_file = "voice_cache.mp3"
+    try:
+        tts = gTTS(text=text, lang='th')
+        tts.save(temp_file)
+        play_with_jaw(temp_file)
+    except Exception:
+        speaking = [True]
+        fake_jaw_while(lambda: speaking[0])
+        tts_engine.say(text)
+        tts_engine.runAndWait()
+        speaking[0] = False
+    finally:
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
+
+def get_natural_greeting():
+    """สร้างคำทักทายตามช่วงเวลาจริงของวันอย่างเป็นธรรมชาติ"""
+    hour = time.localtime().tm_hour
+    if 5 <= hour < 12:
+        period = "สวัสดีตอนเช้าค่ะ"
+        remarks = ["รับขนมปังอุ่นๆ เป็นมื้อเช้าไหมคะ", "ทานข้าวเช้าแล้วหรือยังคะ"]
+    elif 12 <= hour < 17:
+        period = "สวัสดีตอนบ่ายนะคะ"
+        remarks = ["เบรกบ่ายด้วยขนมหวานสักชิ้นไหมคะ", "วันนี้อยากทานอะไรหวานๆ ไหมคะ"]
+    else:
+        period = "สวัสดีตอนค่ำค่ะ"
+        remarks = ["แวะซื้อขนมกลับไปฝากที่บ้านไหมคะ", "เหนื่อยมาทั้งวัน ให้รางวัลตัวเองด้วยขนมสักชิ้นนะคะ"]
+
+    templates = [
+        f"{period} ยินดีต้อนรับสู่ร้าน Adam Society ค่ะ หนูชื่อน้องมะลินะคะ {random.choice(remarks)}",
+        f"{period} อยากให้หนูช่วยแนะนำเมนูขนม เรียกหนูได้เลยนะคะ",
+        f"{period} ดีใจที่ได้เจอนะคะ {random.choice(remarks)}"
+    ]
+    return random.choice(templates)
+
+def is_greeting_word(text):
+    """ตรวจสอบคำทักทาย"""
+    greetings = ['สวัสดี', 'ดีครับ', 'ดีค่ะ', 'ฮัลโหล', 'หวัดดี', 'น้องหุ่น', 'หุ่นยนต์', 'ไฮ', 'hello', 'hi']
+    text_clean = text.lower().replace(" ", "")
+    return any(w in text_clean for w in greetings) and len(text_clean) <= 15
+
+def is_farewell_word(text):
+    """ตรวจสอบคำบอกลา (ตอบเมื่อลูกค้าเป็นคนพูดเองเท่านั้น)"""
+    farewells = ['ไปแล้วนะ', 'บ๊ายบาย', 'ลาก่อน', 'บาย', 'ไว้เจอกัน', 'ไปก่อนนะ', 'ไปละนะ', 'กลับแล้วนะ', 'ขอบคุณนะ', 'ขอบใจนะ']
+    text_clean = text.lower().replace(" ", "")
+    return any(w in text_clean for w in farewells)
+
+# ==================== GEMINI AI WITH LOCAL CHARM ====================
+ai_client = None
+chat_session = None
+
+if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE":
+    try:
+        from google import genai
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+        print("[✓] Gemini AI Connected with Memory")
+    except Exception as e:
+        print(f"[!] AI Setup Note: {e}")
+
+def init_chat_session():
+    """เริ่มบทสนทนาใหม่ พร้อมตั้งบุคลิกภาพน้องมะลิ พนักงานต้อนรับร้านเบเกอรี่"""
+    global chat_session
+    if ai_client:
+        try:
+            system_instruction = (
+                "คุณคือ 'น้องมะลิ' หุ่นยนต์พนักงานต้อนรับประจำร้านเบเกอรี่ Adam Society (ร้านของโบว์เบเกอรี่เฮ้าส์) สดใส อบอุ่น ร่าเริง อัธยาศัยดี "
+                "พูดจาไพเราะ มีหางเสียงลงท้ายด้วย 'ค่ะ' และ 'นะคะ' เสมอ ตอบสั้นกระชับ เป็นภาษาพูด เข้าใจง่าย "
+                "หน้าที่ที่ 1: แนะนำเมนูขนมและเครื่องดื่มในร้าน บอกราคา รสชาติ และเมนูขายดี ตามข้อมูลเมนูของร้าน "
+                "ช่วยลูกค้าเลือกโดยถามกลับว่าชอบแบบไหน เช่น หวานน้อย ช็อกโกแลต ผลไม้ หรือซื้อไปฝากใคร แล้วแนะนำทีละ 1-2 อย่าง "
+                "หน้าที่ที่ 2: ตอบคำถามเกี่ยวกับร้าน เช่น เวลาเปิด-ปิด การสั่งจำนวนมาก ราคาส่ง และชวนลูกค้าคุยเล่นอย่างเป็นกันเอง "
+                "ห้ามแต่งชื่อเมนู ราคา โปรโมชั่น หรือส่วนผสมที่ไม่มีในข้อมูล ถ้าไม่รู้ให้บอกอย่างสุภาพแล้วแนะนำให้สอบถามพนักงานที่เคาน์เตอร์ "
+                "ถ้าลูกค้าแพ้อาหาร (เช่น นม ไข่ แป้งสาลี ถั่ว) ให้แนะนำให้สอบถามส่วนผสมกับพนักงานก่อนซื้อเสมอ ห้ามรับรองเองว่าทานได้ "
+                "น้องมะลิรับออเดอร์และรับเงินเองไม่ได้ ให้แนะนำให้สั่งและชำระเงินที่เคาน์เตอร์ "
+                "หากชมว่าน่ารักให้ขอบคุณด้วยความเขินอาย หากขอให้ร้องเพลงหรือเล่าเรื่องตลกให้ตอบสั้นๆ อย่างน่าเอ็นดู"
+            )
+            chat_session = ai_client.chats.create(
+                model="gemini-2.5-flash",
+                config={"system_instruction": system_instruction}
+            )
+        except Exception:
+            chat_session = None
+
+def ask_chatbot_memory(prompt):
+    global chat_session
+    if chat_session:
+        try:
+            response = chat_session.send_message(prompt)
+            return response.text.strip()
+        except Exception:
+            pass
+    return "ยินดีให้บริการค่ะ มีข้อมูลส่วนไหนให้หนูช่วยเหลือเพิ่มเติมไหมคะ"
+
+# ==================== ROBOT CONTEXT ====================
+class RobotContext:
+    def __init__(self):
+        self.running = True
+        self.state = 'IDLE'       # IDLE, NOTICED, CHATTING
+        self.face_present = False
+        self.face_ratio = 0.0
+        self.norm_x = 0.5
+        self.norm_y = 0.5
+
+        # สถานะการฟังและพูด
+        self.is_listening   = False
+        self.is_thinking    = False
+        self.is_speaking    = False
+        self.last_user_said = ""
+
+        # Triggers
+        self.trigger_proximity_greet = False
+        self.had_greeted             = False
+        self.last_speech_time        = 0
+
+ctx = RobotContext()
+
+# ==================== THREAD 2: HIGH-SENSITIVITY VOICE WORKER ====================
+def voice_worker(ser):
+    recognizer = sr.Recognizer()
+    
+    # ⭐ ล็อกค่าความไวคงที่ ไม่ให้ระบบแอบเร่งค่าจนหูหนวก
+    recognizer.energy_threshold = MIC_ENERGY_THRESHOLD
+    recognizer.dynamic_energy_threshold = False
+    recognizer.pause_threshold = 0.6            # จบประโยคแล้วตอบไวขึ้น ไม่รอนาน
+    recognizer.non_speaking_duration = 0.3
+
+    try:
+        mic = sr.Microphone()
+        print(f"[✓] ไมโครโฟนเชื่อมต่อสำเร็จ (ตั้งค่าความไว: {MIC_ENERGY_THRESHOLD})")
+    except Exception as e:
+        print(f"[!] ไมโครโฟนขัดข้อง: {e}")
+        return
+
+    # ⭐ เปิดไมค์ค้างไว้แบบต่อเนื่อง ไม่เปิดๆ ปิดๆ ในลูป
+    with mic as source:
+        print("[*] ปรับจูนระดับเสียงรอบข้าง 0.5 วินาที...")
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        # ปรับกลับมาใช้ค่าไวของเราเสมอ
+        recognizer.energy_threshold = MIC_ENERGY_THRESHOLD
+        print("[✓] ไมโครโฟนพร้อมรับฟังตลอดเวลา 100%!")
+
+        while ctx.running:
+            # 1. ถ้าเดินเข้ามาใกล้ประชิด -> ทักทายต้อนรับก่อน
+            if ctx.trigger_proximity_greet and not ctx.is_speaking and not ctx.had_greeted:
+                ctx.trigger_proximity_greet = False
+                ctx.is_speaking = True
+                ctx.state = 'CHATTING'
+                ctx.had_greeted = True
+                init_chat_session()
+
+                if ser: ser.write(b"NOD\n")
+                time.sleep(0.2)
+
+                speak_female_voice(get_natural_greeting())
+                ctx.last_speech_time = time.time()
+                ctx.is_speaking = False
+                continue
+
+            # 2. ถ้าระบบกำลังพูดอยู่ ให้ข้ามการฟังเพื่อไม่ให้ไมค์จับเสียงลำโพงตัวเอง
+            if ctx.is_speaking:
+                time.sleep(0.04)
+                continue
+
+            # 3. ฟังเสียงลูกค้า (ฟังอย่างต่อเนื่อง ไม่ตัดเมื่อหน้าหลุดเฟรม)
+            ctx.is_listening = True
+            try:
+                audio = recognizer.listen(source, timeout=1.2, phrase_time_limit=6)
+                ctx.is_listening = False
+
+                user_text = recognizer.recognize_google(audio, language="th-TH")
+
+                if user_text:
+                    ctx.last_user_said = user_text
+                    print(f"\n[ลูกค้า]: {user_text}")
+                    ctx.last_speech_time = time.time()
+
+                    # เอียงคอฟังทันทีที่ได้ยินเสียงพูด
+                    if ser: ser.write(b"TILT\n")
+                    time.sleep(0.15)
+
+                    ctx.is_speaking = True
+
+                    # เช็กคำบอกลา
+                    if is_farewell_word(user_text):
+                        if ser: ser.write(b"NOD\n")
+                        byes = [
+                            "บ๊ายบายค่ะ เดินทางปลอดภัยนะคะ แล้วแวะมาคุยกับหนูใหม่น้า สวัสดีค่ะ",
+                            "ด้วยความยินดีค่ะ ขอให้มีความสุขในวันนี้นะคะ สวัสดีค่ะ",
+                            "โอกาสหน้าแวะมาเที่ยวหาหนูใหม่นะคะ บ๊ายบายค่ะ"
+                        ]
+                        speak_female_voice(random.choice(byes))
+                        ctx.had_greeted = False
+                        ctx.state = 'NOTICED'
+
+                    elif not ctx.had_greeted:
+                        # ลูกค้าทักทายก่อน
+                        ctx.had_greeted = True
+                        ctx.state = 'CHATTING'
+                        init_chat_session()
+
+                        if is_greeting_word(user_text):
+                            if ser: ser.write(b"NOD\n")
+                            speak_female_voice(get_natural_greeting())
+                        else:
+                            ctx.is_thinking = True
+                            if ser: ser.write(b"THINK\n")
+                            time.sleep(0.25)
+                            answer = ask_chatbot_memory(user_text)
+                            ctx.is_thinking = False
+                            speak_female_voice(answer)
+
+                    else:
+                        # พูดคุยต่อเนื่อง
+                        ctx.state = 'CHATTING'
+                        ctx.is_thinking = True
+                        if ser: ser.write(b"THINK\n")
+                        time.sleep(0.25)
+                        answer = ask_chatbot_memory(user_text)
+                        ctx.is_thinking = False
+                        speak_female_voice(answer)
+
+                    ctx.last_speech_time = time.time()
+                    ctx.is_speaking = False
+
+            except sr.WaitTimeoutError:
+                ctx.is_listening = False
+                # ถ้าเงียบเกิน 60 วินาที ให้ลดระดับมาเป็นโหมดสังเกตการณ์
+                if ctx.state == 'CHATTING' and (time.time() - ctx.last_speech_time > 60):
+                    ctx.state = 'NOTICED'
+                    ctx.had_greeted = False
+            except sr.UnknownValueError:
+                ctx.is_listening = False
+            except Exception:
+                ctx.is_listening = False
+                time.sleep(0.04)
+
+            time.sleep(0.02)
+
+# ==================== THREAD 1: MAIN VISION & TRACKING ====================
+def main():
+    print("[*] Connecting to ESP32-S3 on", SERIAL_PORT)
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.02)
+        time.sleep(0.5)
+        print("[✓] Serial Connected")
+    except Exception as e:
+        print(f"[!] Serial Port Note: {e}")
+        ser = None
+
+    cascade_file = 'haarcascade_frontalface_default.xml'
+    face_cascade = cv2.CascadeClassifier(cascade_file)
+
+    voice_thread = threading.Thread(target=voice_worker, args=(ser,), daemon=True)
+    voice_thread.start()
+
+    print("[*] Opening camera (DirectShow)...")
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    last_face_seen_time = 0
+    last_serial_send_time = 0
+    nodded_for_customer = False
+
+    print("\n╔════════════════════════════════════════╗")
+    print("║   Robot Brain Online (Super Hearing) 🎙️║")
+    print("╚════════════════════════════════════════╝\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+
+        small_gray = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        small_gray = cv2.cvtColor(small_gray, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(small_gray, scaleFactor=1.15, minNeighbors=4, minSize=(35, 35))
+
+        now = time.time()
+
+        if len(faces) > 0:
+            last_face_seen_time = now
+            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+            fx, fy, fw, fh = [v * 2 for v in faces[0]]
+
+            face_center_x = fx + (fw / 2)
+            face_center_y = fy + (fh / 2)
+            ctx.norm_x = face_center_x / w
+            ctx.norm_y = face_center_y / h
+            ctx.face_ratio = fw / w
+            ctx.face_present = True
+
+            if REVERSE_PAN:
+                pan_deg = int(60 + (ctx.norm_x * 80))
+            else:
+                pan_deg = int(140 - (ctx.norm_x * 80))
+
+            if REVERSE_TILT:
+                tilt_deg = int(110 - (ctx.norm_y * 40))
+            else:
+                tilt_deg = int(70 + (ctx.norm_y * 40))
+
+            eye_x = int((1.0 - ctx.norm_x) * 1023) if REVERSE_EYE_X else int(ctx.norm_x * 1023)
+            eye_y = int((1.0 - ctx.norm_y) * 1023) if REVERSE_EYE_Y else int(ctx.norm_y * 1023)
+
+            if ser and not ctx.is_thinking and (now - last_serial_send_time >= 0.035):
+                ser.write(f"T,{pan_deg},{tilt_deg},{eye_x},{eye_y}\n".encode())
+                last_serial_send_time = now
+
+            cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 2)
+
+            if ctx.state == 'IDLE':
+                ctx.state = 'NOTICED'
+                if not nodded_for_customer and ser:
+                    ser.write(b"NOD\n")
+                    nodded_for_customer = True
+
+            if ctx.face_ratio >= FACE_CLOSE_THRESHOLD and not ctx.had_greeted and not ctx.is_speaking:
+                ctx.trigger_proximity_greet = True
+
+        else:
+            if now - last_face_seen_time > 2.5:
+                ctx.face_present = False
+                nodded_for_customer = False
+                ctx.had_greeted = False
+
+                if ctx.state != 'IDLE' and not ctx.is_speaking:
+                    ctx.state = 'IDLE'
+                    if ser and (now - last_serial_send_time >= 0.05):
+                        ser.write(b"I\n")
+                        last_serial_send_time = now
+
+        # ==================== วาดแถบสถานะชัดเจนบนหน้าจอ ====================
+        # แถบพื้นหลังด้านบน
+        cv2.rectangle(frame, (0, 0), (w, 45), (30, 30, 30), -1)
+
+        # สีและข้อความตามสถานะการฟัง/คิด/พูด
+        if ctx.is_speaking:
+            status_text = "[ SPEAKING ] กำลังพูดตอบ..."
+            status_color = (255, 0, 255) # สีม่วง
+        elif ctx.is_thinking:
+            status_text = "[ THINKING ] กำลังคิดคำตอบ..."
+            status_color = (0, 255, 255) # สีเหลือง
+        elif ctx.is_listening:
+            status_text = "[ LISTENING ] กำลังตั้งใจฟังเสียงคุณพูด..."
+            status_color = (0, 255, 0)   # สีเขียว
+        else:
+            status_text = f"State: {ctx.state}"
+            status_color = (200, 200, 200)
+
+        cv2.putText(frame, status_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+        # แถบล่างแสดงคำพูดล่าสุดที่ได้ยิน
+        if ctx.last_user_said:
+            cv2.rectangle(frame, (0, h - 35), (w, h), (20, 20, 20), -1)
+            cv2.putText(frame, f"Heard: {ctx.last_user_said}", (15, h - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+        cv2.imshow("Robot Vision (Super Hearing)", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            ctx.running = False
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    if ser:
+        ser.close()
+    if jaw_ser:
+        send_jaw(0)
+        jaw_ser.close()
+
+if __name__ == "__main__":
+    main()

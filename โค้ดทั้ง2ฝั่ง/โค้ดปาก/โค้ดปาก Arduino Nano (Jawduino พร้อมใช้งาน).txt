@@ -1,0 +1,75 @@
+/*
+ * Jawduino - Audio Reactive Jaw Controller
+ * Target: Arduino Nano + KA2284 Audio Level Module + MG90S Servo
+ */
+
+#include <Servo.h>
+
+// ========== PIN CONFIGURATION ==========
+const int PIN_LED_LOW  = A0;  // รับสัญญาณจาก LED D2 (เสียงเบา)
+const int PIN_LED_MID  = A1;  // รับสัญญาณจาก LED D3 (เสียงกลาง)
+const int PIN_LED_HIGH = A2;  // รับสัญญาณจาก LED D4 (เสียงดัง)
+const int PIN_SERVO    = 9;   // ขาขับเซอร์โวขากรรไกร (D9)
+
+// ========== JAW CALIBRATION (ปรับองศาตามกลไกปาก) ==========
+// ปรับตัวเลขตามโครงสร้างปากหุ่นของคุณ (0 - 180 องศา)
+const int JAW_CLOSED = 15;    // องศาขณะ "หุบปากสนิท"
+const int JAW_OPEN   = 60;    // องศาขณะ "อ้าปากกว้างสุด" (ไม่ควรเกิน 70 เพื่อถนอมเฟือง)
+
+// ระดับเกณฑ์แรงดันที่ตัดสินว่า LED ติด (ค่าแอนะล็อก < 350 คือไฟ LED ติด)
+const int THRESHOLD = 350;
+
+// ค่าความนุ่มนวลในการเคลื่อนที่ (0.1 = ช้ามาก, 0.4 = กำลังดีเป็นธรรมชาติ, 1.0 = เร็วทันทีไม่มีหน่วง)
+const float SMOOTH_FACTOR = 0.35;
+
+Servo jawServo;
+
+float currentAngle = JAW_CLOSED;
+int targetAngle = JAW_CLOSED;
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // ตั้งค่าขาอ่านแอนะล็อก
+  pinMode(PIN_LED_LOW, INPUT);
+  pinMode(PIN_LED_MID, INPUT);
+  pinMode(PIN_LED_HIGH, INPUT);
+
+  // เชื่อมต่อเซอร์โว
+  jawServo.attach(PIN_SERVO);
+  jawServo.write(JAW_CLOSED);
+  delay(500);
+
+  Serial.println(F("=================================="));
+  Serial.println(F("    Jawduino System Ready!        "));
+  Serial.println(F("=================================="));
+}
+
+void loop()
+{
+  // อ่านค่าแรงดันจากขา LED ทั้ง 3 ดวง
+  int valLow  = analogRead(PIN_LED_LOW);
+  int valMid  = analogRead(PIN_LED_MID);
+  int valHigh = analogRead(PIN_LED_HIGH);
+
+  // นับจำนวน LED ที่สว่างตามระดับความดังเสียง (0 ถึง 3 ระดับ)
+  int soundLevel = 0;
+  if (valLow < THRESHOLD)  soundLevel++;
+  if (valMid < THRESHOLD)  soundLevel++;
+  if (valHigh < THRESHOLD) soundLevel++;
+
+  // คำนวณเป้าหมายองศาปากตามระดับความดังเสียง
+  // สเต็ป 0: ปิดปาก
+  // สเต็ป 1: อ้าปากเล็กน้อย (~33%)
+  // สเต็ป 2: อ้าปากปานกลาง (~66%)
+  // สเต็ป 3: อ้าปากเต็มที่ (100%)
+  targetAngle = map(soundLevel, 0, 3, JAW_CLOSED, JAW_OPEN);
+
+  // คำนวณความนุ่มนวลแบบ Smooth Filter (ป้องกันปากสั่นและกระตุก)
+  currentAngle += (targetAngle - currentAngle) * SMOOTH_FACTOR;
+  jawServo.write((int)currentAngle);
+
+  // ดีเลย์ควบคุมรอบการอัปเดต (ประมาณ 50-60 Hz พอดีกับเซอร์โว)
+  delay(18);
+}

@@ -1,0 +1,18 @@
+# Python 3.10 (ทดสอบกับ 3.10.11 บน Windows 11)
+
+# ใช้ร่วมกัน (โปรแกรมจำลอง + robot_brain.py)
+opencv-python
+pyserial
+gTTS
+numpy
+
+# อ่านไฟล์ .docx / .pdf ในโฟลเดอร์ information (โปรแกรมจำลอง)
+python-docx
+pypdf
+
+# robot_brain.py (หุ่นตัวจริงแบบไม่ใช้โปรแกรมจำลอง)
+pygame
+pyttsx3
+SpeechRecognition
+PyAudio
+google-genai

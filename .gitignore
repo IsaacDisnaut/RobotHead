@@ -1,0 +1,18 @@
+# รหัสลับ (API key) — ห้ามขึ้น git
+api.txt
+gemini_key.txt
+.env
+
+# ไฟล์ชั่วคราวของ Python / เสียงพูด
+__pycache__/
+*.pyc
+voice_cache.mp3
+
+# ตัวติดตั้งโปรแกรม (ไฟล์ใหญ่ ดาวน์โหลดเองจากเว็บทางการ)
+โปรแกรมติดตั้งในคอม/
+
+# ไฟล์ของระบบ / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/

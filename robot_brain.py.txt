@@ -1,0 +1,253 @@
+import os
+import sys
+import time
+import random
+import serial
+import serial.tools.list_ports
+import cv2
+import pygame
+import speech_recognition as sr
+import pyttsx3
+from gtts import gTTS
+
+# ==================== CONFIGURATION ====================
+SERIAL_PORT = "COM3"       # เปลี่ยนเป็นพอร์ตของ ESP32-S3 (เช่น COM3, COM4 หรือ /dev/ttyUSB0)
+BAUD_RATE = 115200
+
+SOUND_GREETING_DIR = "sounds/greetings"
+SOUND_GOODBYE_DIR = "sounds/goodbye"
+
+# เกณฑ์วัดระยะใกล้-ไกลจากสัดส่วนขนาดใบหน้าต่อเฟรมกล้อง
+# ยิ่งคนยืนใกล้ สัดส่วนความกว้างใบหน้า (face_w / frame_w) จะยิ่งสูง
+FACE_CLOSE_THRESHOLD = 0.28   # ยืนใกล้ (เริ่มทักทาย & Chatbot)
+FACE_FAR_THRESHOLD = 0.16     # ยืนห่างออกไป
+
+# เกณฑ์ฝั่งซ้าย-ขวาของหน้าจอ (0.0 = ซ้ายสุด, 1.0 = ขวาสุด)
+EXIT_RIGHT_THRESHOLD = 0.75   # เดินออกทางขวา
+
+CHATBOT_TIMEOUT_SEC = 60      # ถ้าลูกค้าไม่พูด 1 นาที จะตัดกลับไปโหมดมองหน้าตาม
+
+# ใส่ Gemini API Key ของท่านที่นี่ (หากไม่มีจะใช้ระบบตอบคำถามอัตโนมัติแบบออฟไลน์)
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+
+# ==================== INITIALIZE AUDIO & TTS ====================
+pygame.mixer.init()
+tts_engine = pyttsx3.init()
+tts_engine.setProperty('rate', 155)
+
+def play_random_sound(folder_path):
+    """สุ่มเล่น 1 ไฟล์เสียงจากโฟลเดอร์ และรอจนเล่นจบ"""
+    if not os.path.exists(folder_path):
+        print(f"[!] Warning: Folder not found: {folder_path}")
+        return
+    files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.mp3', '.wav', '.ogg'))]
+    if not files:
+        print(f"[!] Warning: No audio files in {folder_path}")
+        return
+    chosen_file = os.path.join(folder_path, random.choice(files))
+    print(f"[*] Playing sound: {chosen_file}")
+    try:
+        pygame.mixer.music.load(chosen_file)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.05)
+    except Exception as e:
+        print(f"[!] Audio play error: {e}")
+
+def speak_text(text):
+    """พูดข้อความตอบกลับภาษาไทย (ใช้ gTTS สลับ pyttsx3)"""
+    print(f"[Robot]: {text}")
+    try:
+        tts = gTTS(text=text, lang='th')
+        temp_file = "temp_voice.mp3"
+        tts.save(temp_file)
+        pygame.mixer.music.load(temp_file)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.05)
+        pygame.mixer.music.unload()
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+    except Exception:
+        # Fallback เป็น pyttsx3 แบบออฟไลน์
+        tts_engine.say(text)
+        tts_engine.runAndWait()
+
+# ==================== GEMINI AI SETUP ====================
+ai_client = None
+if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE":
+    try:
+        from google import genai
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+        print("[✓] Gemini AI Connected")
+    except Exception as e:
+        print(f"[!] Gemini setup error: {e}")
+
+def ask_chatbot(prompt):
+    if ai_client:
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=f"คุณคือหุ่นยนต์ต้อนรับหน้าร้านที่สุภาพ เป็นมิตร ตอบสั้นกระชับเข้าใจง่ายเป็นภาษาไทย คำถามคือ: {prompt}"
+            )
+            return response.text.strip()
+        except Exception as e:
+            print(f"[!] Gemini Query Error: {e}")
+    # คำตอบพื้นฐานหากต่อ AI ไม่ได้
+    return "ยินดีต้อนรับครับ มีอะไรให้ผมช่วยเหลือสอบถามได้เลยนะครับ"
+
+# ==================== MAIN PROGRAM ====================
+def main():
+    print("[*] Connecting to ESP32-S3 on", SERIAL_PORT)
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        time.sleep(2)
+        print("[✓] Serial Connected")
+    except Exception as e:
+        print(f"[!] Serial Port Error: {e}")
+        print("[*] Running in Simulation Mode (No Serial)")
+        ser = None
+
+    cap = cv2.VideoCapture(0)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 3000
+
+    # สถานะของหุ่น: 'IDLE', 'TRACKING', 'GREETING', 'CHATBOT', 'GOODBYE'
+    state = 'IDLE'
+    last_interaction_time = time.time()
+    had_close_interaction = False
+
+    print("\n╔════════════════════════════════════════╗")
+    print("║     Robot Brain System is Running      ║")
+    print("╚════════════════════════════════════════╝\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # กลับภาพซ้ายขวาเพื่อให้เหมือนกระจกเงา (Mirror)
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+
+        if len(faces) > 0:
+            # เลือกใบหน้าที่ใหญ่ที่สุด (คนที่อยู่ใกล้ที่สุด)
+            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+            fx, fy, fw, fh = faces[0]
+
+            face_center_x = fx + (fw / 2)
+            face_center_y = fy + (fh / 2)
+            norm_x = face_center_x / w
+            norm_y = face_center_y / h
+            face_ratio = fw / w  # สัดส่วนความใกล้
+
+            # คำนวณองศา Servo (Pan: 140 หันซ้าย, 40 หันขวา / Tilt: 60 เงย, 120 ก้ม)
+            pan_deg = int(140 - (norm_x * 80))
+            tilt_deg = int(70 + (norm_y * 40))
+
+            # คำนวณพิกัดดวงตา (0 - 1023)
+            eye_x = int(norm_x * 1023)
+            eye_y = int(norm_y * 1023)
+
+            # ส่งคำสั่งให้ ESP32 หันหน้าและกรอกตามองคน
+            if ser:
+                ser.write(f"T,{pan_deg},{tilt_deg},{eye_x},{eye_y}\n".encode())
+
+            # วาดกรอบตรวจจับบนหน้าจอพรีวิว
+            cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 2)
+            cv2.putText(frame, f"State: {state} | Ratio: {face_ratio:.2f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+            # ================= STATE MACHINE LOGIC =================
+            if state == 'IDLE':
+                state = 'TRACKING'
+                print("[State] Person entered -> TRACKING")
+
+            elif state == 'TRACKING':
+                # ถ้าคนเดินเข้ามาใกล้หน้าหุ่น
+                if face_ratio >= FACE_CLOSE_THRESHOLD:
+                    state = 'GREETING'
+
+            elif state == 'GREETING':
+                print("[State] In close range -> Playing Greeting Sound...")
+                play_random_sound(SOUND_GREETING_DIR)
+                had_close_interaction = True
+                last_interaction_time = time.time()
+                state = 'CHATBOT'
+                print("[State] Switched to CHATBOT Mode")
+
+            elif state == 'CHATBOT':
+                # ตรวจสอบว่าหมดเวลา 1 นาทีที่ไม่มีการคุยหรือไม่
+                if time.time() - last_interaction_time > CHATBOT_TIMEOUT_SEC:
+                    print("[State] Chatbot Timeout (1 min) -> Back to TRACKING")
+                    state = 'TRACKING'
+                    continue
+
+                # ฟังเสียงสนทนา
+                cv2.imshow("Robot Vision", frame)
+                cv2.waitKey(1)
+                with sr.Microphone() as source:
+                    print("\n[Chatbot] Listening for customer...")
+                    recognizer.adjust_for_ambient_noise(source, duration=0.6)
+                    try:
+                        audio = recognizer.listen(source, timeout=4, phrase_time_limit=8)
+                        user_text = recognizer.recognize_google(audio, language="th-TH")
+                        print(f"[Customer]: {user_text}")
+                        last_interaction_time = time.time()
+
+                        # ขอคำตอบจาก AI และส่งเสียงพูด
+                        answer = ask_chatbot(user_text)
+                        speak_text(answer)
+                        last_interaction_time = time.time()
+                    except (sr.WaitTimeoutError, sr.UnknownValueError):
+                        pass
+                    except Exception as e:
+                        print(f"[!] Mic error: {e}")
+
+                # ถ้าคนเดินถอยห่างออกไปในขณะที่อยู่ในโหมด Chatbot
+                if face_ratio < FACE_FAR_THRESHOLD:
+                    print("[State] Person moved away -> Back to TRACKING")
+                    state = 'TRACKING'
+
+            # ถ้าเคยคุยใกล้ๆ แล้ว ตอนนี้เดินออกไปทางขวาของร้าน
+            if had_close_interaction and norm_x >= EXIT_RIGHT_THRESHOLD:
+                state = 'GOODBYE'
+
+        else:
+            # ไม่พบใบหน้าคน
+            if state == 'GOODBYE' or (had_close_interaction and state == 'TRACKING'):
+                print("[State] Customer exiting shop -> Playing Goodbye Sound...")
+                play_random_sound(SOUND_GOODBYE_DIR)
+                had_close_interaction = False
+                # หันหน้ากลับจุดศูนย์กลาง
+                if ser:
+                    ser.write(b"T,90,90,512,512\n")
+                    time.sleep(0.5)
+                    ser.write(b"I\n")
+                state = 'IDLE'
+                print("[State] Returned to IDLE")
+            else:
+                if state != 'IDLE':
+                    state = 'IDLE'
+                    if ser:
+                        ser.write(b"I\n")
+                    print("[State] No face detected -> Returned to IDLE")
+
+            cv2.putText(frame, "State: IDLE (Looking around)", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.imshow("Robot Vision", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    if ser:
+        ser.close()
+
+if __name__ == "__main__":
+    main()
