@@ -144,6 +144,24 @@ def init_ai():
     AI_STATUS = "พร้อมใช้งาน" if CHAT_MODEL else "ไม่พบโมเดลแชทที่รองรับ"
 
 
+AI_RETRY_SECONDS = 10
+_ai_lock = threading.Lock()
+_ai_last_try = 0.0
+
+
+def ensure_ai():
+    """ถ้าตอนเปิดโปรแกรมต่อ Groq ไม่ได้ (เช่น เน็ตยังไม่มา) ให้ลองใหม่เรื่อยๆ ทุก 10 วินาที"""
+    global _ai_last_try
+    if CHAT_MODEL or not API_KEY:
+        return
+    with _ai_lock:
+        if CHAT_MODEL or time.time() - _ai_last_try < AI_RETRY_SECONDS:
+            return
+        _ai_last_try = time.time()
+        init_ai()
+        print(f"[AI] ลองเชื่อมต่อใหม่: {AI_STATUS}  chat={CHAT_MODEL}  stt={STT_MODEL}")
+
+
 # ==================== KNOWLEDGE BASE (โฟลเดอร์ information) ====================
 INFO_DIR = os.path.join(ROBOT_DIR, "information")
 INFO_EXTS = {".txt", ".md", ".csv", ".json", ".docx", ".pdf"}
@@ -302,6 +320,7 @@ def clean_actions(actions):
 
 
 def chat_with_ai(history, robot_state):
+    ensure_ai()
     if not CHAT_MODEL:
         return {
             "reply": "ยินดีให้บริการค่ะ มีข้อมูลส่วนไหนให้หนูช่วยเหลือเพิ่มเติมไหมคะ",
@@ -422,8 +441,9 @@ def filter_transcript(data, voiced_ms, strict=True):
 
 
 def speech_to_text(audio_bytes, mime, voiced_ms=0, strict=True):
+    ensure_ai()
     if not STT_MODEL:
-        raise RuntimeError("ไม่มีโมเดล Whisper สำหรับแปลงเสียง")
+        raise RuntimeError(f"ไม่มีโมเดล Whisper สำหรับแปลงเสียง ({AI_STATUS})")
     ext = "webm" if "webm" in mime else ("ogg" if "ogg" in mime else "wav")
     boundary = "----robotsim" + uuid.uuid4().hex
     parts = []
@@ -464,9 +484,11 @@ def text_to_speech(text):
 
 # ==================== REAL ROBOT (OPTIONAL) ====================
 class SerialBridge:
-    def __init__(self):
+    def __init__(self, name):
+        self.name = name
         self.ser = None
         self.port = None
+        self.auto = True         # ให้ AutoConnector หาบอร์ดเอง (ปิดเมื่อผู้ใช้กดตัดการเชื่อมต่อเอง)
         self.lock = threading.Lock()
 
     def ports(self):
@@ -480,9 +502,14 @@ class SerialBridge:
     def connect(self, port, baud=115200):
         import serial
 
+        self.attach(serial.Serial(port, baud, timeout=0.02))
+
+    def attach(self, ser):
+        """รับพอร์ตที่เปิดไว้แล้ว (จากการสแกน) มาใช้ต่อ ไม่ต้องเปิดใหม่ (Nano จะได้ไม่รีเซ็ตซ้ำ)"""
         self.disconnect()
-        self.ser = serial.Serial(port, baud, timeout=0.02)
-        self.port = port
+        with self.lock:
+            self.ser = ser
+            self.port = ser.port
 
     def disconnect(self):
         with self.lock:
@@ -498,12 +525,106 @@ class SerialBridge:
         with self.lock:
             if not self.ser:
                 return False
-            self.ser.write((line.strip() + "\n").encode())
-            return True
+            try:
+                self.ser.write((line.strip() + "\n").encode())
+                return True
+            except Exception as e:
+                # ถอดสาย USB -> ปล่อยพอร์ต ให้ AutoConnector หาใหม่เมื่อเสียบกลับ
+                print(f"[!] {self.name} ({self.port}) หลุด: {e}")
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                self.port = None
+                return False
 
 
-serial_bridge = SerialBridge()   # ESP32-S3 (หัว/ตา/คอ)
-jaw_bridge = SerialBridge()      # Arduino Nano (ปาก) รับคำสั่ง J<0-100>
+serial_bridge = SerialBridge("ESP32-S3")   # หัว/ตา/คอ
+jaw_bridge = SerialBridge("Nano ปาก")       # รับคำสั่ง J<0-100>
+
+
+class AutoConnector:
+    """หาบอร์ดหุ่นเองทุกๆ 3 วินาที ไม่ต้องเลือก COM port
+    - สแกนเฉพาะพอร์ต USB (ข้ามพอร์ต Bluetooth ซึ่งเปิดแล้วค้างนาน)
+    - เปิดพอร์ตแล้วถาม: ESP32-S3 ตอบ "STATUS ..." / Nano ตอบ "JAW OK"
+    - พอร์ตที่ไม่ใช่บอร์ดหุ่น จำไว้ไม่สแกนซ้ำจนกว่าจะถอดเสียบใหม่"""
+
+    INTERVAL = 3.0
+    PROBE_SECONDS = 2.5      # Nano รีเซ็ตตอนเปิดพอร์ต ใช้เวลาบูต ~1.5 วิ
+
+    def __init__(self, bridges):
+        self.bridges = bridges   # {"esp32": serial_bridge, "jaw": jaw_bridge}
+        self.ignored = set()     # พอร์ตที่สแกนแล้วไม่ใช่บอร์ดหุ่น
+        self.status = "กำลังค้นหาบอร์ด..."
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                self.scan()
+            except Exception as e:
+                print(f"[!] ค้นหาบอร์ดอัตโนมัติผิดพลาด: {e}")
+            time.sleep(self.INTERVAL)
+
+    def scan(self):
+        from serial.tools import list_ports
+
+        usb = {p.device: p for p in list_ports.comports() if p.vid is not None}
+        self.ignored &= set(usb)   # ถอดออกไปแล้ว -> เสียบใหม่ค่อยสแกนอีกครั้ง
+        for b in self.bridges.values():
+            if b.port and b.port not in usb:
+                print(f"[!] {b.name} ถูกถอดออกจาก {b.port}")
+                b.disconnect()
+        wanted = {k: b for k, b in self.bridges.items() if b.auto and not b.port}
+        if not wanted:
+            return
+        in_use = {b.port for b in self.bridges.values() if b.port}
+        for dev in usb:
+            if dev in in_use or dev in self.ignored:
+                continue
+            kind, ser = self.probe(dev)
+            if kind in wanted:
+                wanted.pop(kind).attach(ser)
+                print(f"[✓] เชื่อมต่อ {self.bridges[kind].name} อัตโนมัติที่ {dev}")
+            else:
+                if ser:
+                    ser.close()
+                if kind is None:
+                    self.ignored.add(dev)
+            if not wanted:
+                break
+
+    def probe(self, dev):
+        import serial
+
+        try:
+            ser = serial.Serial(dev, 115200, timeout=0.1, write_timeout=0.5)
+        except Exception:
+            return "busy", None   # พอร์ตถูกโปรแกรมอื่นใช้อยู่ (เช่น Arduino IDE) ลองใหม่รอบหน้า
+        buf = b""
+        t0 = time.time()
+        asked = 0
+        try:
+            while time.time() - t0 < self.PROBE_SECONDS:
+                # ถามซ้ำทุก ~0.8 วิ เผื่อบอร์ดยังบูตไม่เสร็จตอนถามครั้งแรก
+                if time.time() - t0 >= asked * 0.8:
+                    ser.write(b"STATUS\nPING\n")
+                    asked += 1
+                buf += ser.read(256)
+                if b"JAW OK" in buf:
+                    return "jaw", ser
+                if b"STATUS " in buf:
+                    return "esp32", ser
+        except Exception:
+            pass
+        ser.close()
+        return None, None
+
+
+auto_connector = AutoConnector({"esp32": serial_bridge, "jaw": jaw_bridge})
 
 
 # ==================== WEBCAM (เหมือน THREAD 1 ใน robot_brain.py) ====================
@@ -860,6 +981,7 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         p = url.path
         if p == "/api/status":
+            ensure_ai()
             self.send_json(
                 {
                     "ai_status": AI_STATUS,
@@ -868,6 +990,8 @@ class Handler(BaseHTTPRequestHandler):
                     "serial_ports": serial_bridge.ports(),
                     "serial_connected": serial_bridge.port,
                     "jaw_connected": jaw_bridge.port,
+                    "serial_auto": serial_bridge.auto,
+                    "jaw_auto": jaw_bridge.auto,
                 }
             )
         elif p == "/api/tts":
@@ -960,28 +1084,28 @@ class Handler(BaseHTTPRequestHandler):
                 text, rejected = speech_to_text(self.read_body(), self.headers.get("Content-Type", ""), voiced_ms, strict)
                 print(f"[ได้ยิน] {text}" if text else f"[ไม่นับ] {rejected}")
                 self.send_json({"text": text, "rejected": rejected})
-            elif p == "/api/serial/connect":
+            elif p in ("/api/serial/connect", "/api/jaw/connect"):
+                # port = "auto" ให้ค้นหาเอง / ชื่อพอร์ต = เลือกเอง / ว่าง = ตัดการเชื่อมต่อ (และหยุดค้นหาอัตโนมัติ)
+                bridge = serial_bridge if p == "/api/serial/connect" else jaw_bridge
                 req = json.loads(self.read_body() or b"{}")
-                if req.get("port"):
-                    serial_bridge.connect(req["port"], int(req.get("baud", 115200)))
-                    print(f"[✓] เชื่อมต่อหุ่นจริงที่ {req['port']}")
+                port = req.get("port")
+                if port == "auto":
+                    bridge.auto = True
+                elif port:
+                    bridge.auto = True
+                    bridge.connect(port, int(req.get("baud", 115200)))
+                    print(f"[✓] เชื่อมต่อ {bridge.name} ที่ {port}")
                 else:
-                    serial_bridge.disconnect()
-                self.send_json({"connected": serial_bridge.port})
+                    bridge.auto = False
+                    bridge.disconnect()
+                    print(f"[*] ตัดการเชื่อมต่อ {bridge.name} (ปิดการค้นหาอัตโนมัติ)")
+                self.send_json({"connected": bridge.port, "auto": bridge.auto})
             elif p == "/api/serial/send":
                 req = json.loads(self.read_body() or b"{}")
                 ok = True
                 for line in req.get("lines", []):
                     ok = serial_bridge.send(str(line)) and ok
                 self.send_json({"ok": ok})
-            elif p == "/api/jaw/connect":
-                req = json.loads(self.read_body() or b"{}")
-                if req.get("port"):
-                    jaw_bridge.connect(req["port"], int(req.get("baud", 115200)))
-                    print(f"[✓] เชื่อมต่อปากหุ่น (Nano) ที่ {req['port']}")
-                else:
-                    jaw_bridge.disconnect()
-                self.send_json({"connected": jaw_bridge.port})
             elif p == "/api/jaw/send":
                 req = json.loads(self.read_body() or b"{}")
                 pct = max(0, min(100, int(req.get("pct", 0))))
@@ -998,6 +1122,9 @@ def main():
     init_ai()
     print(f"[AI] {AI_STATUS}  chat={CHAT_MODEL}  stt={STT_MODEL}")
     knowledge.refresh()
+    if "--no-serial" not in sys.argv:
+        print("[*] ค้นหาบอร์ดหุ่น (ESP32-S3 / Nano) ทางพอร์ต USB อัตโนมัติ...")
+        auto_connector.start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}/"
     print("\n╔══════════════════════════════════════════════╗")

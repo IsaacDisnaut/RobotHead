@@ -364,34 +364,34 @@ async function refreshStatus() {
     $('#sAi').textContent = s.ai_status;
     $('#sChatModel').textContent = s.chat_model || '-';
     $('#sSttModel').textContent = s.stt_model || '-';
-    const opts = s.serial_ports.length
-      ? s.serial_ports.map((p) => `<option value="${p.port}">${p.port} — ${p.desc}</option>`).join('')
-      : '<option value="">(ไม่พบ COM พอร์ต)</option>';
+    const opts = '<option value="auto">🔍 ค้นหาอัตโนมัติ</option>' +
+      s.serial_ports.map((p) => `<option value="${p.port}">${p.port} — ${p.desc}</option>`).join('');
     for (const id of ['#portSel', '#jawPortSel']) {
       const sel = $(id), cur = sel.value;
       sel.innerHTML = opts;
       if (cur) sel.value = cur;
     }
-    setHw(s.serial_connected);
-    setJawHw(s.jaw_connected);
+    setHw(s.serial_connected, s.serial_auto);
+    setJawHw(s.jaw_connected, s.jaw_auto);
   } catch {
     $('#aiStatus').textContent = 'ติดต่อเซิร์ฟเวอร์ไม่ได้ — เปิด robot_sim_server.py ก่อน';
     $('#aiDot').className = 'dot bad';
   }
 }
-function setHw(port) {
+// auto = เซิร์ฟเวอร์กำลังค้นหาบอร์ดเองอยู่ (เสียบสาย USB แล้วจะเชื่อมต่อให้เองภายในไม่กี่วินาที)
+function setHw(port, auto = true) {
   hwConnected = port;
-  $('#chipHw').textContent = port ? `หุ่นจริง: ${port}` : 'หุ่นจริง: ไม่ได้เชื่อมต่อ';
+  $('#chipHw').textContent = port ? `หุ่นจริง: ${port}` : (auto ? 'หุ่นจริง: กำลังค้นหา...' : 'หุ่นจริง: ไม่ได้เชื่อมต่อ');
   $('#chipHw').classList.toggle('on', !!port);
-  $('#portConnect').textContent = port ? 'ตัดการเชื่อมต่อ' : 'เชื่อมต่อ';
+  $('#portConnect').textContent = port ? 'ตัดการเชื่อมต่อ' : (auto ? 'กำลังค้นหา...' : 'เชื่อมต่อ');
 }
 $('#portRefresh').onclick = refreshStatus;
 
 // ปากหุ่นจริง (Nano): ส่งระดับอ้าปากตามเสียงพูดในจำลอง
 let jawHw = null, jawSentPct = -1, jawSentAt = 0;
-function setJawHw(port) {
+function setJawHw(port, auto = true) {
   jawHw = port;
-  $('#jawConnect').textContent = port ? `ตัดการเชื่อมต่อปาก (${port})` : 'เชื่อมต่อปาก';
+  $('#jawConnect').textContent = port ? `ตัดการเชื่อมต่อปาก (${port})` : (auto ? 'กำลังค้นหาปาก...' : 'เชื่อมต่อปาก');
 }
 $('#jawConnect').onclick = async () => {
   const port = jawHw ? null : $('#jawPortSel').value;
@@ -401,7 +401,7 @@ $('#jawConnect').onclick = async () => {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port }),
   })).json();
   if (r.error) toast('เชื่อมต่อปากไม่ได้: ' + r.error);
-  setJawHw(r.connected || null);
+  setJawHw(r.connected || null, r.auto);
 };
 setInterval(() => {
   if (!jawHw) return;
@@ -447,7 +447,7 @@ $('#portConnect').onclick = async () => {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port }),
   })).json();
   if (r.error) toast('เชื่อมต่อไม่ได้: ' + r.error);
-  setHw(r.connected || null);
+  setHw(r.connected || null, r.auto);
 };
 
 // ================== Tabs / toast / splash ==================
@@ -523,5 +523,5 @@ function updateHud() {
 
 syncOut();
 refreshStatus();
-setInterval(refreshStatus, 15000);
+setInterval(refreshStatus, 3000);   // ถี่พอให้เห็นตอนเสียบ/ถอดบอร์ดแล้วเชื่อมต่อเอง
 requestAnimationFrame(loop);
